@@ -1,4 +1,4 @@
-use crate::dep_graph::{DepNodeIndex, SerializedDepNodeIndex};
+use crate::dep_graph::DepNodeIndex;
 use crate::hir;
 use crate::hir::def_id::{CrateNum, DefIndex, DefId, LocalDefId, LOCAL_CRATE};
 use crate::hir::map::definitions::DefPathHash;
@@ -62,11 +62,11 @@ pub struct OnDiskCache<'sess> {
 
     // A map from dep-node to the position of the cached query result in
     // `serialized_data`.
-    query_result_index: FxHashMap<SerializedDepNodeIndex, AbsoluteBytePos>,
+    query_result_index: FxHashMap<DepNodeIndex, AbsoluteBytePos>,
 
     // A map from dep-node to the position of any associated diagnostics in
     // `serialized_data`.
-    prev_diagnostics_index: FxHashMap<SerializedDepNodeIndex, AbsoluteBytePos>,
+    prev_diagnostics_index: FxHashMap<DepNodeIndex, AbsoluteBytePos>,
 
     alloc_decoding_state: AllocDecodingState,
 }
@@ -82,8 +82,8 @@ struct Footer {
     interpret_alloc_index: Vec<u32>,
 }
 
-type EncodedQueryResultIndex = Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>;
-type EncodedDiagnosticsIndex = Vec<(SerializedDepNodeIndex, AbsoluteBytePos)>;
+type EncodedQueryResultIndex = Vec<(DepNodeIndex, AbsoluteBytePos)>;
+type EncodedDiagnosticsIndex = Vec<(DepNodeIndex, AbsoluteBytePos)>;
 type EncodedDiagnostics = Vec<Diagnostic>;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, RustcEncodable, RustcDecodable)]
@@ -232,12 +232,12 @@ impl<'sess> OnDiskCache<'sess> {
                     use crate::ty::query::config::QueryDescription;
                     if const_eval::cache_on_disk(tcx, key.clone()) {
                         if let Ok(ref value) = entry.value {
-                            let dep_node = SerializedDepNodeIndex::new(entry.index.index());
+                            let dep_node = DepNodeIndex::new(entry.index.index());
 
                             // Record position of the cache entry
                             qri.push((dep_node, AbsoluteBytePos::new(enc.position())));
 
-                            // Encode the type check tables with the SerializedDepNodeIndex
+                            // Encode the type check tables with the DepNodeIndex
                             // as tag.
                             enc.encode_tagged(dep_node, value)?;
                         }
@@ -255,7 +255,7 @@ impl<'sess> OnDiskCache<'sess> {
                 let pos = AbsoluteBytePos::new(encoder.position());
                 // Let's make sure we get the expected type here:
                 let diagnostics: &EncodedDiagnostics = diagnostics;
-                let dep_node_index = SerializedDepNodeIndex::new(dep_node_index.index());
+                let dep_node_index = DepNodeIndex::new(dep_node_index.index());
                 encoder.encode_tagged(dep_node_index, diagnostics)?;
 
                 Ok((dep_node_index, pos))
@@ -328,7 +328,7 @@ impl<'sess> OnDiskCache<'sess> {
     /// Loads a diagnostic emitted during the previous compilation session.
     pub fn load_diagnostics<'a, 'tcx>(&self,
                                       tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                      dep_node_index: SerializedDepNodeIndex)
+                                      dep_node_index: DepNodeIndex)
                                       -> Vec<Diagnostic> {
         let diagnostics: Option<EncodedDiagnostics> = self.load_indexed(
             tcx,
@@ -353,10 +353,10 @@ impl<'sess> OnDiskCache<'sess> {
     }
 
     /// Returns the cached query result if there is something in the cache for
-    /// the given `SerializedDepNodeIndex`; otherwise returns `None`.
+    /// the given `DepNodeIndex`; otherwise returns `None`.
     pub fn try_load_query_result<'tcx, T>(&self,
                                           tcx: TyCtxt<'_, 'tcx, 'tcx>,
-                                          dep_node_index: SerializedDepNodeIndex)
+                                          dep_node_index: DepNodeIndex)
                                           -> Option<T>
         where T: Decodable
     {
@@ -384,8 +384,8 @@ impl<'sess> OnDiskCache<'sess> {
 
     fn load_indexed<'tcx, T>(&self,
                              tcx: TyCtxt<'_, 'tcx, 'tcx>,
-                             dep_node_index: SerializedDepNodeIndex,
-                             index: &FxHashMap<SerializedDepNodeIndex,
+                             dep_node_index: DepNodeIndex,
+                             index: &FxHashMap<DepNodeIndex,
                                                AbsoluteBytePos>,
                              debug_tag: &'static str)
                              -> Option<T>
@@ -1085,12 +1085,12 @@ fn encode_query_results<'enc, 'a, 'tcx, Q, E>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         assert!(map.active.is_empty());
         for (key, entry) in map.results.iter() {
             if Q::cache_on_disk(tcx, key.clone()) {
-                let dep_node = SerializedDepNodeIndex::new(entry.index.index());
+                let dep_node = DepNodeIndex::new(entry.index.index());
 
                 // Record position of the cache entry
                 query_result_index.push((dep_node, AbsoluteBytePos::new(encoder.position())));
 
-                // Encode the type check tables with the SerializedDepNodeIndex
+                // Encode the type check tables with the DepNodeIndex
                 // as tag.
                 encoder.encode_tagged(dep_node, &entry.value)?;
             }
