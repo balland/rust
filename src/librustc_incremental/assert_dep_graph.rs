@@ -34,7 +34,7 @@
 //! ```
 
 use graphviz as dot;
-use rustc::dep_graph::{DepGraphQuery, DepNode, DepKind};
+use rustc::dep_graph::{ReconstructedDepGraph, CompletedDepGraph, DepGraphQuery, DepNode, DepKind};
 use rustc::dep_graph::debug::{DepNodeFilter, EdgeFilter};
 use rustc::hir::def_id::DefId;
 use rustc::ty::TyCtxt;
@@ -51,10 +51,13 @@ use std::io::Write;
 use syntax::ast;
 use syntax_pos::Span;
 
-pub fn assert_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+pub(crate) fn assert_dep_graph<'tcx>(
+    tcx: TyCtxt<'_, 'tcx, 'tcx>,
+    dep_graph: &CompletedDepGraph,
+) {
     tcx.dep_graph.with_ignore(|| {
         if tcx.sess.opts.debugging_opts.dump_dep_graph {
-            dump_graph(tcx);
+            dump_graph(&ReconstructedDepGraph::new(dep_graph));
         }
 
         // if the `rustc_attrs` feature is not enabled, then the
@@ -82,7 +85,7 @@ pub fn assert_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
         }
 
         // Check paths.
-        check_paths(tcx, &if_this_changed, &then_this_would_need);
+        check_paths(tcx, dep_graph, &if_this_changed, &then_this_would_need);
     })
 }
 
@@ -184,10 +187,12 @@ impl<'a, 'tcx> Visitor<'tcx> for IfThisChanged<'a, 'tcx> {
     }
 }
 
-fn check_paths<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                         if_this_changed: &Sources,
-                         then_this_would_need: &Targets)
-{
+fn check_paths<'a, 'tcx>(
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    dep_graph: &CompletedDepGraph,
+    if_this_changed: &Sources,
+    then_this_would_need: &Targets,
+) {
     // Return early here so as not to construct the query, which is not cheap.
     if if_this_changed.is_empty() {
         for &(target_span, _, _, _) in then_this_would_need {
@@ -198,7 +203,7 @@ fn check_paths<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         }
         return;
     }
-    let query = tcx.dep_graph.query();
+    let query = ReconstructedDepGraph::new(dep_graph).query();
     for &(_, source_def_id, ref source_dep_node) in if_this_changed {
         let dependents = query.transitive_predecessors(source_dep_node);
         for &(target_span, ref target_pass, _, ref target_dep_node) in then_this_would_need {
@@ -217,9 +222,9 @@ fn check_paths<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     }
 }
 
-fn dump_graph(tcx: TyCtxt<'_, '_, '_>) {
+fn dump_graph(dep_graph: &ReconstructedDepGraph) {
     let path: String = env::var("RUST_DEP_GRAPH").unwrap_or_else(|_| "dep_graph".to_string());
-    let query = tcx.dep_graph.query();
+    let query = dep_graph.query();
 
     let nodes = match env::var("RUST_DEP_GRAPH_FILTER") {
         Ok(string) => {
