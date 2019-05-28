@@ -15,7 +15,7 @@
 
 use std::iter::FromIterator;
 use std::vec::Vec;
-use rustc::dep_graph::{DepNode, label_strs};
+use rustc::dep_graph::{CompletedDepGraph, ReconstructedDepGraph, DepNode, label_strs};
 use rustc::hir;
 use rustc::hir::{ItemKind as HirItem, ImplItemKind, TraitItemKind};
 use rustc::hir::Node as HirNode;
@@ -206,16 +206,21 @@ impl Assertion {
     }
 }
 
-pub fn check_dirty_clean_annotations<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
+pub fn check_dirty_clean_annotations<'a, 'tcx>(
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    dep_graph: &CompletedDepGraph,
+) {
     // can't add `#[rustc_dirty]` etc without opting in to this feature
     if !tcx.features().rustc_attrs {
         return;
     }
 
     tcx.dep_graph.with_ignore(|| {
+        let graph = ReconstructedDepGraph::new(dep_graph);
         let krate = tcx.hir().krate();
         let mut dirty_clean_visitor = DirtyCleanVisitor {
             tcx,
+            graph,
             checked_attrs: Default::default(),
         };
         krate.visit_all_item_likes(&mut dirty_clean_visitor);
@@ -234,8 +239,9 @@ pub fn check_dirty_clean_annotations<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     })
 }
 
-pub struct DirtyCleanVisitor<'a, 'tcx:'a> {
+struct DirtyCleanVisitor<'a, 'tcx:'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
+    graph: ReconstructedDepGraph,
     checked_attrs: FxHashSet<ast::AttrId>,
 }
 
@@ -472,9 +478,8 @@ impl<'a, 'tcx> DirtyCleanVisitor<'a, 'tcx> {
 
     fn assert_dirty(&self, item_span: Span, dep_node: DepNode) {
         debug!("assert_dirty({:?})", dep_node);
-
-        let dep_node_index = self.tcx.dep_graph.dep_node_index_of(&dep_node);
-        let current_fingerprint = self.tcx.dep_graph.fingerprint_of(dep_node_index);
+        let dep_node_index = self.graph.dep_node_index_of(&dep_node);
+        let current_fingerprint = self.graph.fingerprint_of(dep_node_index);
         let prev_fingerprint = self.tcx.dep_graph.prev_fingerprint_of(&dep_node);
 
         if Some(current_fingerprint) == prev_fingerprint {
@@ -487,9 +492,8 @@ impl<'a, 'tcx> DirtyCleanVisitor<'a, 'tcx> {
 
     fn assert_clean(&self, item_span: Span, dep_node: DepNode) {
         debug!("assert_clean({:?})", dep_node);
-
-        let dep_node_index = self.tcx.dep_graph.dep_node_index_of(&dep_node);
-        let current_fingerprint = self.tcx.dep_graph.fingerprint_of(dep_node_index);
+        let dep_node_index = self.graph.dep_node_index_of(&dep_node);
+        let current_fingerprint = self.graph.fingerprint_of(dep_node_index);
         let prev_fingerprint = self.tcx.dep_graph.prev_fingerprint_of(&dep_node);
 
         if Some(current_fingerprint) != prev_fingerprint {
@@ -590,7 +594,7 @@ fn expect_associated_value(tcx: TyCtxt<'_, '_, '_>, item: &NestedMetaItem) -> as
 // A visitor that collects all #[rustc_dirty]/#[rustc_clean] attributes from
 // the HIR. It is used to verfiy that we really ran checks for all annotated
 // nodes.
-pub struct FindAllAttrs<'a, 'tcx:'a> {
+struct FindAllAttrs<'a, 'tcx:'a> {
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     attr_names: Vec<Symbol>,
     found_attrs: Vec<&'tcx Attribute>,

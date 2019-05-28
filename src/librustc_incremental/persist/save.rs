@@ -6,9 +6,11 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::join;
 use rustc_serialize::Encodable as RustcEncodable;
 use rustc_serialize::opaque::Encoder;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::Path;
 
+use crate::assert_dep_graph::assert_dep_graph;
 use super::data::*;
 use super::fs::*;
 use super::dirty_clean;
@@ -19,34 +21,40 @@ pub fn save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     debug!("save_dep_graph()");
     tcx.dep_graph.with_ignore(|| {
         let sess = tcx.sess;
+
         if sess.opts.incremental.is_none() {
+            if !tcx.sess.opts.build_dep_graph() {
+                return;
+            }
+
+            let results = time(tcx.sess, "finish dep graph", || {
+                tcx.dep_graph.complete()
+            });
+
+            time(tcx.sess,
+                "assert dep graph",
+                || assert_dep_graph(tcx, &results));
+
             return;
         }
 
+        let dir = &sess.incr_comp_session_dir();
         let query_cache_path = query_cache_path(sess);
-        let dep_graph_path = dep_graph_path(sess);
+        let results_path = dir.join(DEP_GRAPH_RESULTS_FILENAME);
 
         join(move || {
             if tcx.sess.opts.debugging_opts.incremental_queries {
                 time(sess, "persist query result cache", || {
                     save_in(sess,
-                            query_cache_path,
-                            |e| encode_query_cache(tcx, e));
+                            &query_cache_path,
+                            |e| encode_query_cache(tcx, e)).unwrap();
                 });
             }
         }, || {
-            time(sess, "persist dep-graph", || {
-                save_in(sess,
-                        dep_graph_path,
-                        |e| {
-                            time(sess, "encode dep-graph", || {
-                                encode_dep_graph(tcx, e)
-                            })
-                        });
+            time(sess, "save dep-graph", || {
+                finish_dep_graph(tcx, &results_path)
             });
         });
-
-        dirty_clean::check_dirty_clean_annotations(tcx);
     })
 }
 
@@ -60,7 +68,7 @@ pub fn save_work_product_index(sess: &Session,
     debug!("save_work_product_index()");
     dep_graph.assert_ignored();
     let path = work_products_path(sess);
-    save_in(sess, path, |e| encode_work_product_index(&new_work_products, e));
+    save_in(sess, &path, |e| encode_work_product_index(&new_work_products, e)).unwrap();
 
     // We also need to clean out old work-products, as not all of them are
     // deleted during invalidation. Some object files don't change their
@@ -86,25 +94,26 @@ pub fn save_work_product_index(sess: &Session,
     });
 }
 
-fn save_in<F>(sess: &Session, path_buf: PathBuf, encode: F)
-    where F: FnOnce(&mut Encoder)
+pub(super) fn save_in<F>(sess: &Session, path: &Path, encode: F) -> io::Result<File>
+where
+    F: FnOnce(&mut Encoder)
 {
-    debug!("save: storing data in {}", path_buf.display());
+    debug!("save: storing data in {}", path.display());
 
     // delete the old dep-graph, if any
     // Note: It's important that we actually delete the old file and not just
     // truncate and overwrite it, since it might be a shared hard-link, the
     // underlying data of which we don't want to modify
-    if path_buf.exists() {
-        match fs::remove_file(&path_buf) {
+    if path.exists() {
+        match fs::remove_file(path) {
             Ok(()) => {
                 debug!("save: remove old file");
             }
             Err(err) => {
                 sess.err(&format!("unable to delete old dep-graph at `{}`: {}",
-                                  path_buf.display(),
+                                  path.display(),
                                   err));
-                return;
+                return Err(err);
             }
         }
     }
@@ -116,30 +125,40 @@ fn save_in<F>(sess: &Session, path_buf: PathBuf, encode: F)
 
     // write the data out
     let data = encoder.into_inner();
-    match fs::write(&path_buf, data) {
+    let mut file = File::create(path)?;
+
+    match file.write_all(&data) {
         Ok(_) => {
             debug!("save: data written to disk successfully");
         }
         Err(err) => {
             sess.err(&format!("failed to write dep-graph to `{}`: {}",
-                              path_buf.display(),
+                              path.display(),
                               err));
-            return;
+            return Err(err);
         }
     }
+
+    Ok(file)
 }
 
-fn encode_dep_graph(tcx: TyCtxt<'_, '_, '_>,
-                    encoder: &mut Encoder) {
-    // First encode the commandline arguments hash
-    tcx.sess.opts.dep_tracking_hash().encode(encoder).unwrap();
-
+fn finish_dep_graph<'tcx>(tcx: TyCtxt<'_, 'tcx, 'tcx>, results_path: &Path) {
+    let sess = tcx.sess;
     // Encode the graph data.
-    let serialized_graph = time(tcx.sess, "getting serialized graph", || {
-        tcx.dep_graph.serialize()
+    let mut results = time(tcx.sess, "finish graph serialization", || {
+        tcx.dep_graph.complete()
     });
 
+    time(tcx.sess,
+         "assert dep graph",
+         || assert_dep_graph(tcx, &results));
+
+
+    dirty_clean::check_dirty_clean_annotations(tcx, &results);
+
     if tcx.sess.opts.debugging_opts.incremental_info {
+        let data = &results.model.as_ref().unwrap().data;
+
         #[derive(Clone)]
         struct Stat {
             kind: DepKind,
@@ -147,21 +166,20 @@ fn encode_dep_graph(tcx: TyCtxt<'_, '_, '_>,
             edge_counter: u64,
         }
 
-        let total_node_count = serialized_graph.nodes.len();
-        let total_edge_count = serialized_graph.edge_list_data.len();
+        let total_node_count = data.len();
+        let total_edge_count: usize = data.values().map(|d| d.edges.len()).sum();
 
         let mut counts: FxHashMap<_, Stat> = FxHashMap::default();
 
-        for (i, &node) in serialized_graph.nodes.iter_enumerated() {
-            let stat = counts.entry(node.kind).or_insert(Stat {
-                kind: node.kind,
+        for node in data.values() {
+            let stat = counts.entry(node.node.kind).or_insert(Stat {
+                kind: node.node.kind,
                 node_counter: 0,
                 edge_counter: 0,
             });
 
             stat.node_counter += 1;
-            let (edge_start, edge_end) = serialized_graph.edge_list_indices[i];
-            stat.edge_counter += (edge_end - edge_start) as u64;
+            stat.edge_counter += node.edges.len() as u64;
         }
 
         let mut counts: Vec<_> = counts.values().cloned().collect();
@@ -214,8 +232,20 @@ fn encode_dep_graph(tcx: TyCtxt<'_, '_, '_>,
         println!("[incremental]");
     }
 
-    time(tcx.sess, "encoding serialized graph", || {
-        serialized_graph.encode(encoder).unwrap();
+    if !cfg!(debug_assertions) {
+        // Only save the model in debug builds
+        results.model = None;
+    }
+
+    time(sess, "save dep-graph results", || {
+        save_in(sess, results_path, |e| {
+            // First encode the commandline arguments hash
+            sess.opts.dep_tracking_hash().encode(e).unwrap();
+            time(sess, "encode dep-graph results", || {
+                // Save the result vector
+                results.encode(e).unwrap();
+            });
+        }).unwrap();
     });
 }
 

@@ -119,6 +119,7 @@ use rand::{RngCore, thread_rng};
 
 const LOCK_FILE_EXT: &str = ".lock";
 const DEP_GRAPH_FILENAME: &str = "dep-graph.bin";
+pub const DEP_GRAPH_RESULTS_FILENAME: &str = "dep-graph-results.bin";
 const WORK_PRODUCTS_FILENAME: &str = "work-products.bin";
 const QUERY_CACHE_FILENAME: &str = "query-cache.bin";
 
@@ -379,7 +380,8 @@ pub fn delete_all_session_dir_contents(sess: &Session) -> io::Result<()> {
     let sess_dir_iterator = sess.incr_comp_session_dir().read_dir()?;
     for entry in sess_dir_iterator {
         let entry = entry?;
-        safe_remove_file(&entry.path())?
+        let path = entry.path();
+        safe_remove_file(&path)?
     }
     Ok(())
 }
